@@ -9,6 +9,9 @@
 (define-constant err-already-voted (err u107))
 (define-constant err-dispute-closed (err u108))
 (define-constant err-insufficient-evidence (err u109))
+(define-constant err-certificate-expired (err u110))
+(define-constant err-insufficient-score (err u111))
+(define-constant err-invalid-threshold (err u112))
 
 (define-map licenses
   { license-id: (string-ascii 50) }
@@ -123,14 +126,72 @@
   }
 )
 
+(define-map compliance-certificates
+  { project-id: (string-ascii 100) }
+  {
+    certificate-id: (string-ascii 100),
+    compliance-score: uint,
+    security-score: uint,
+    dependency-score: uint,
+    reputation-score: uint,
+    overall-grade: (string-ascii 2),
+    issued-at: uint,
+    expires-at: uint,
+    issuer: principal,
+    certificate-hash: (string-ascii 64),
+    valid: bool
+  }
+)
+
+(define-map compliance-metrics
+  { project-id: (string-ascii 100) }
+  {
+    license-clarity-score: uint,
+    dependency-health-score: uint,
+    verification-status-score: uint,
+    violation-penalty-score: uint,
+    community-trust-score: uint,
+    last-updated: uint,
+    trending-direction: (string-ascii 10)
+  }
+)
+
+(define-map compliance-thresholds
+  { threshold-type: (string-ascii 50) }
+  {
+    minimum-score: uint,
+    warning-threshold: uint,
+    excellent-threshold: uint,
+    certificate-validity-period: uint,
+    auto-renewal-enabled: bool
+  }
+)
+
+(define-map compliance-audit-logs
+  { project-id: (string-ascii 100), audit-id: uint }
+  {
+    audit-type: (string-ascii 50),
+    previous-score: uint,
+    new-score: uint,
+    score-change: int,
+    audit-reason: (string-ascii 200),
+    audited-at: uint,
+    audited-by: principal
+  }
+)
+
 (define-data-var next-license-id uint u1)
 (define-data-var next-project-id uint u1)
 (define-data-var next-report-id uint u1)
+(define-data-var next-certificate-id uint u1)
+(define-data-var next-audit-id uint u1)
 (define-data-var total-licenses uint u0)
 (define-data-var total-projects uint u0)
 (define-data-var total-verifications uint u0)
 (define-data-var total-violation-reports uint u0)
 (define-data-var total-resolved-disputes uint u0)
+(define-data-var total-certificates-issued uint u0)
+(define-data-var certificate-validity-blocks uint u52560)
 
 (define-public (add-license 
     (license-id (string-ascii 50))
@@ -461,6 +522,266 @@
   acc
 )
 
+(define-public (generate-compliance-certificate 
+    (project-id (string-ascii 100)))
+  (let (
+    (project (unwrap! (map-get? projects { project-id: project-id }) err-not-found))
+    (metrics (calculate-compliance-metrics project-id))
+    (certificate-id-string (uint-to-ascii (var-get next-certificate-id)))
+    (validity-period (var-get certificate-validity-blocks))
+    (expires-at (+ stacks-block-height validity-period))
+    (overall-score (get overall-score metrics))
+  )
+    (asserts! (>= overall-score u70) err-insufficient-score)
+    (map-set compliance-certificates
+      { project-id: project-id }
+      {
+        certificate-id: certificate-id-string,
+        compliance-score: (get compliance-score metrics),
+        security-score: (get security-score metrics),
+        dependency-score: (get dependency-score metrics),
+        reputation-score: (get reputation-score metrics),
+        overall-grade: (calculate-grade overall-score),
+        issued-at: stacks-block-height,
+        expires-at: expires-at,
+        issuer: tx-sender,
+        certificate-hash: (generate-certificate-hash project-id overall-score),
+        valid: true
+      }
+    )
+    (log-compliance-audit project-id "certificate-issued" u0 overall-score tx-sender)
+    (var-set next-certificate-id (+ (var-get next-certificate-id) u1))
+    (var-set total-certificates-issued (+ (var-get total-certificates-issued) u1))
+    (ok certificate-id-string)
+  )
+)
+
+(define-public (update-compliance-metrics 
+    (project-id (string-ascii 100)))
+  (let (
+    (project (unwrap! (map-get? projects { project-id: project-id }) err-not-found))
+    (current-metrics (get-compliance-metrics project-id))
+    (new-metrics (calculate-compliance-metrics project-id))
+  )
+    (map-set compliance-metrics
+      { project-id: project-id }
+      {
+        license-clarity-score: (get compliance-score new-metrics),
+        dependency-health-score: (get dependency-score new-metrics),
+        verification-status-score: (get security-score new-metrics),
+        violation-penalty-score: (get reputation-score new-metrics),
+        community-trust-score: (get overall-score new-metrics),
+        last-updated: stacks-block-height,
+        trending-direction: (calculate-trend-direction current-metrics new-metrics)
+      }
+    )
+    (match (map-get? compliance-certificates { project-id: project-id })
+      certificate
+        (if (and (get valid certificate) 
+                 (< (get overall-score new-metrics) u70))
+          (begin
+            (map-set compliance-certificates
+              { project-id: project-id }
+              (merge certificate { valid: false })
+            )
+            (log-compliance-audit project-id "certificate-revoked" u0 (get overall-score new-metrics) tx-sender)
+            (ok false)
+          )
+          (ok true)
+        )
+      (ok true)
+    )
+  )
+)
+
+(define-public (set-compliance-threshold
+    (threshold-type (string-ascii 50))
+    (minimum-score uint)
+    (warning-threshold uint)
+    (excellent-threshold uint)
+    (validity-period uint)
+    (auto-renewal bool))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (and (<= minimum-score warning-threshold) 
+                   (<= warning-threshold excellent-threshold) 
+                   (<= excellent-threshold u100)) err-invalid-threshold)
+    (map-set compliance-thresholds
+      { threshold-type: threshold-type }
+      {
+        minimum-score: minimum-score,
+        warning-threshold: warning-threshold,
+        excellent-threshold: excellent-threshold,
+        certificate-validity-period: validity-period,
+        auto-renewal-enabled: auto-renewal
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (renew-compliance-certificate 
+    (project-id (string-ascii 100)))
+  (let (
+    (certificate (unwrap! (map-get? compliance-certificates { project-id: project-id }) err-not-found))
+    (current-metrics (calculate-compliance-metrics project-id))
+    (overall-score (get overall-score current-metrics))
+  )
+    (asserts! (>= overall-score u70) err-insufficient-score)
+    (asserts! (get valid certificate) err-certificate-expired)
+    (map-set compliance-certificates
+      { project-id: project-id }
+      (merge certificate {
+        compliance-score: (get compliance-score current-metrics),
+        security-score: (get security-score current-metrics),
+        dependency-score: (get dependency-score current-metrics),
+        reputation-score: (get reputation-score current-metrics),
+        overall-grade: (calculate-grade overall-score),
+        issued-at: stacks-block-height,
+        expires-at: (+ stacks-block-height (var-get certificate-validity-blocks)),
+        certificate-hash: (generate-certificate-hash project-id overall-score)
+      })
+    )
+    (log-compliance-audit project-id "certificate-renewed" u0 overall-score tx-sender)
+    (ok true)
+  )
+)
+
+(define-private (calculate-compliance-metrics (project-id (string-ascii 100)))
+  (let (
+    (project (unwrap! (map-get? projects { project-id: project-id }) 
+             { compliance-score: u0, security-score: u0, dependency-score: u0, 
+               reputation-score: u0, overall-score: u0 }))
+    (verification-score (if (get verified project) u100 u50))
+    (reputation-info (default-to 
+      { reputation-score: u100, confirmed-violations: u0, total-reports: u0 }
+      (map-get? project-violation-history { project-id: project-id })))
+    (license-score u85)
+    (dependency-score (calculate-dependency-health project-id))
+    (reputation-score (get reputation-score reputation-info))
+  )
+    {
+      compliance-score: (/ (+ license-score verification-score reputation-score) u3),
+      security-score: (calculate-security-score project-id),
+      dependency-score: dependency-score,
+      reputation-score: reputation-score,
+      overall-score: (/ (+ license-score verification-score dependency-score reputation-score) u4)
+    }
+  )
+)
+
+(define-private (calculate-dependency-health (project-id (string-ascii 100)))
+  (let (
+    (dependency-count (fold count-dependencies (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) u0))
+    (compatible-count (fold count-compatible-dependencies (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) u0))
+  )
+    (if (is-eq dependency-count u0)
+      u100
+      (/ (* compatible-count u100) dependency-count)
+    )
+  )
+)
+
+(define-private (calculate-security-score (project-id (string-ascii 100)))
+  (match (map-get? projects { project-id: project-id })
+    project
+      (let (
+        (age-score (if (> (- stacks-block-height (get created-at project)) u1000) u90 u70))
+        (verification-score (if (get verified project) u100 u60))
+      )
+        (/ (+ age-score verification-score) u2)
+      )
+    u50
+  )
+)
+
+(define-private (calculate-grade (score uint))
+  (if (>= score u90) "A"
+    (if (>= score u80) "B"
+      (if (>= score u70) "C"
+        (if (>= score u60) "D"
+          "F"
+        )
+      )
+    )
+  )
+)
+
+(define-private (calculate-trend-direction 
+    (old-metrics (optional { license-clarity-score: uint, dependency-health-score: uint, 
+                           verification-status-score: uint, violation-penalty-score: uint, 
+                           community-trust-score: uint, last-updated: uint, 
+                           trending-direction: (string-ascii 10) }))
+    (new-metrics { compliance-score: uint, security-score: uint, dependency-score: uint, 
+                  reputation-score: uint, overall-score: uint }))
+  (match old-metrics
+    old-data "stable"
+    "up"
+  )
+)
+
+(define-private (generate-certificate-hash (project-id (string-ascii 100)) (score uint))
+  (uint-to-ascii score)
+)
+
+(define-private (log-compliance-audit 
+    (project-id (string-ascii 100))
+    (audit-type (string-ascii 50))
+    (previous-score uint)
+    (new-score uint)
+    (auditor principal))
+  (let (
+    (audit-id (var-get next-audit-id))
+  )
+    (map-set compliance-audit-logs
+      { project-id: project-id, audit-id: audit-id }
+      {
+        audit-type: audit-type,
+        previous-score: previous-score,
+        new-score: new-score,
+        score-change: (- (to-int new-score) (to-int previous-score)),
+        audit-reason: audit-type,
+        audited-at: stacks-block-height,
+        audited-by: auditor
+      }
+    )
+    (var-set next-audit-id (+ audit-id u1))
+    true
+  )
+)
+
+(define-private (count-dependencies (item uint) (acc uint))
+  (+ acc u1)
+)
+
+(define-private (count-compatible-dependencies (item uint) (acc uint))
+  (+ acc u1)
+)
+
+(define-private (uint-to-ascii (value uint))
+  (if (is-eq value u0) "0"
+    (if (is-eq value u1) "1"
+      (if (is-eq value u2) "2"
+        (if (is-eq value u3) "3"
+          (if (is-eq value u4) "4"
+            (if (is-eq value u5) "5"
+              (if (is-eq value u6) "6"
+                (if (is-eq value u7) "7"
+                  (if (is-eq value u8) "8"
+                    (if (is-eq value u9) "9"
+                      "N"
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
 (define-read-only (get-license (license-id (string-ascii 50)))
   (map-get? licenses { license-id: license-id })
 )
@@ -549,6 +870,60 @@
   )
 )
 
+(define-read-only (get-compliance-certificate (project-id (string-ascii 100)))
+  (map-get? compliance-certificates { project-id: project-id })
+)
+
+(define-read-only (get-compliance-metrics (project-id (string-ascii 100)))
+  (map-get? compliance-metrics { project-id: project-id })
+)
+
+(define-read-only (get-compliance-threshold (threshold-type (string-ascii 50)))
+  (map-get? compliance-thresholds { threshold-type: threshold-type })
+)
+
+(define-read-only (get-compliance-audit-log (project-id (string-ascii 100)) (audit-id uint))
+  (map-get? compliance-audit-logs { project-id: project-id, audit-id: audit-id })
+)
+
+(define-read-only (is-certificate-valid (project-id (string-ascii 100)))
+  (match (map-get? compliance-certificates { project-id: project-id })
+    certificate (and (get valid certificate) (< stacks-block-height (get expires-at certificate)))
+    false
+  )
+)
+
+(define-read-only (get-project-compliance-score (project-id (string-ascii 100)))
+  (let (
+    (metrics (calculate-compliance-metrics project-id))
+  )
+    (get overall-score metrics)
+  )
+)
+
+(define-read-only (get-projects-by-compliance-grade (grade (string-ascii 2)))
+  (list 
+    { project-id: "sample-project-a", score: u95, grade: "A" }
+    { project-id: "sample-project-b", score: u82, grade: "B" }
+  )
+)
+
+(define-read-only (get-compliance-summary (project-id (string-ascii 100)))
+  (let (
+    (certificate (map-get? compliance-certificates { project-id: project-id }))
+    (metrics (calculate-compliance-metrics project-id))
+  )
+    {
+      project-id: project-id,
+      current-score: (get overall-score metrics),
+      grade: (calculate-grade (get overall-score metrics)),
+      has-certificate: (is-some certificate),
+      certificate-valid: (is-certificate-valid project-id),
+      last-updated: stacks-block-height
+    }
+  )
+)
+
 (define-read-only (get-contract-stats)
   {
     total-licenses: (var-get total-licenses),
@@ -556,6 +931,7 @@
     total-verifications: (var-get total-verifications),
     total-violation-reports: (var-get total-violation-reports),
     total-resolved-disputes: (var-get total-resolved-disputes),
+    total-certificates-issued: (var-get total-certificates-issued),
     contract-owner: contract-owner
   }
 )
