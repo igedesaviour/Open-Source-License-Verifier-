@@ -12,6 +12,10 @@
 (define-constant err-certificate-expired (err u110))
 (define-constant err-insufficient-score (err u111))
 (define-constant err-invalid-threshold (err u112))
+(define-constant err-insufficient-stake (err u113))
+(define-constant err-stake-locked (err u114))
+(define-constant err-no-stake-found (err u115))
+(define-constant err-transfer-failed (err u116))
 
 (define-map licenses
   { license-id: (string-ascii 50) }
@@ -180,18 +184,69 @@
   }
 )
 
+(define-map compliance-stakes
+  { project-id: (string-ascii 100) }
+  {
+    staked-amount: uint,
+    required-stake: uint,
+    stake-locked-until: uint,
+    rewards-earned: uint,
+    slashed-amount: uint,
+    staker: principal,
+    staked-at: uint,
+    last-reward-claim: uint
+  }
+)
+
+(define-map stake-requirements
+  { compliance-grade: (string-ascii 2) }
+  {
+    minimum-stake: uint,
+    lock-period: uint,
+    reward-rate: uint,
+    slash-percentage: uint
+  }
+)
+
+(define-map insurance-pool
+  { pool-id: uint }
+  {
+    total-pooled: uint,
+    total-claims-paid: uint,
+    pool-contributors: uint,
+    created-at: uint,
+    active: bool
+  }
+)
+
+(define-map stake-slashing-history
+  { project-id: (string-ascii 100), slash-id: uint }
+  {
+    slashed-amount: uint,
+    reason: (string-ascii 200),
+    violation-report-id: uint,
+    slashed-at: uint,
+    beneficiary: (optional principal)
+  }
+)
+
 (define-data-var next-license-id uint u1)
 (define-data-var next-project-id uint u1)
 (define-data-var next-report-id uint u1)
 (define-data-var next-certificate-id uint u1)
 (define-data-var next-audit-id uint u1)
+(define-data-var next-slash-id uint u1)
 (define-data-var total-licenses uint u0)
 (define-data-var total-projects uint u0)
 (define-data-var total-verifications uint u0)
 (define-data-var total-violation-reports uint u0)
 (define-data-var total-resolved-disputes uint u0)
 (define-data-var total-certificates-issued uint u0)
+(define-data-var total-staked-amount uint u0)
+(define-data-var total-slashed-amount uint u0)
+(define-data-var total-rewards-distributed uint u0)
 (define-data-var certificate-validity-blocks uint u52560)
+(define-data-var insurance-pool-balance uint u0)
 
 (define-public (add-license 
     (license-id (string-ascii 50))
@@ -782,6 +837,175 @@
   )
 )
 
+(define-public (stake-compliance-insurance
+    (project-id (string-ascii 100))
+    (amount uint))
+  (let (
+    (project (unwrap! (map-get? projects { project-id: project-id }) err-not-found))
+    (compliance-score (get-project-compliance-score project-id))
+    (grade (calculate-grade compliance-score))
+    (requirements (get-stake-requirement-for-grade grade))
+    (minimum-stake (get minimum-stake requirements))
+    (lock-period (get lock-period requirements))
+  )
+    (asserts! (is-eq tx-sender (get owner project)) err-unauthorized)
+    (asserts! (>= amount minimum-stake) err-insufficient-stake)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (map-set compliance-stakes
+      { project-id: project-id }
+      {
+        staked-amount: amount,
+        required-stake: minimum-stake,
+        stake-locked-until: (+ stacks-block-height lock-period),
+        rewards-earned: u0,
+        slashed-amount: u0,
+        staker: tx-sender,
+        staked-at: stacks-block-height,
+        last-reward-claim: stacks-block-height
+      }
+    )
+    (var-set total-staked-amount (+ (var-get total-staked-amount) amount))
+    (ok true)
+  )
+)
+
+(define-public (withdraw-stake
+    (project-id (string-ascii 100)))
+  (let (
+    (stake (unwrap! (map-get? compliance-stakes { project-id: project-id }) err-no-stake-found))
+    (withdrawable-amount (- (get staked-amount stake) (get slashed-amount stake)))
+  )
+    (asserts! (is-eq tx-sender (get staker stake)) err-unauthorized)
+    (asserts! (>= stacks-block-height (get stake-locked-until stake)) err-stake-locked)
+    (asserts! (> withdrawable-amount u0) err-insufficient-stake)
+    (try! (as-contract (stx-transfer? withdrawable-amount tx-sender (get staker stake))))
+    (map-delete compliance-stakes { project-id: project-id })
+    (var-set total-staked-amount (- (var-get total-staked-amount) withdrawable-amount))
+    (ok withdrawable-amount)
+  )
+)
+
+(define-public (claim-stake-rewards
+    (project-id (string-ascii 100)))
+  (let (
+    (stake (unwrap! (map-get? compliance-stakes { project-id: project-id }) err-no-stake-found))
+    (compliance-score (get-project-compliance-score project-id))
+    (grade (calculate-grade compliance-score))
+    (requirements (get-stake-requirement-for-grade grade))
+    (reward-amount (calculate-stake-rewards stake requirements))
+  )
+    (asserts! (is-eq tx-sender (get staker stake)) err-unauthorized)
+    (asserts! (> reward-amount u0) err-insufficient-stake)
+    (try! (as-contract (stx-transfer? reward-amount tx-sender (get staker stake))))
+    (map-set compliance-stakes
+      { project-id: project-id }
+      (merge stake {
+        rewards-earned: (+ (get rewards-earned stake) reward-amount),
+        last-reward-claim: stacks-block-height
+      })
+    )
+    (var-set total-rewards-distributed (+ (var-get total-rewards-distributed) reward-amount))
+    (ok reward-amount)
+  )
+)
+
+(define-public (slash-stake-for-violation
+    (project-id (string-ascii 100))
+    (violation-report-id uint)
+    (beneficiary (optional principal)))
+  (let (
+    (stake (unwrap! (map-get? compliance-stakes { project-id: project-id }) err-no-stake-found))
+    (report (unwrap! (map-get? violation-reports { report-id: violation-report-id }) err-not-found))
+    (compliance-score (get-project-compliance-score project-id))
+    (grade (calculate-grade compliance-score))
+    (requirements (get-stake-requirement-for-grade grade))
+    (slash-percentage (get slash-percentage requirements))
+    (slash-amount (/ (* (get staked-amount stake) slash-percentage) u100))
+    (slash-id (var-get next-slash-id))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (is-eq (get status report) "confirmed") err-invalid-status)
+    (asserts! (> slash-amount u0) err-insufficient-stake)
+    (match beneficiary
+      beneficiary-principal
+        (try! (as-contract (stx-transfer? slash-amount tx-sender beneficiary-principal)))
+      (var-set insurance-pool-balance (+ (var-get insurance-pool-balance) slash-amount))
+    )
+    (map-set compliance-stakes
+      { project-id: project-id }
+      (merge stake {
+        slashed-amount: (+ (get slashed-amount stake) slash-amount)
+      })
+    )
+    (map-set stake-slashing-history
+      { project-id: project-id, slash-id: slash-id }
+      {
+        slashed-amount: slash-amount,
+        reason: (get violation-type report),
+        violation-report-id: violation-report-id,
+        slashed-at: stacks-block-height,
+        beneficiary: beneficiary
+      }
+    )
+    (var-set next-slash-id (+ slash-id u1))
+    (var-set total-slashed-amount (+ (var-get total-slashed-amount) slash-amount))
+    (ok slash-amount)
+  )
+)
+
+(define-public (contribute-to-insurance-pool
+    (amount uint))
+  (begin
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (var-set insurance-pool-balance (+ (var-get insurance-pool-balance) amount))
+    (ok true)
+  )
+)
+
+(define-public (set-stake-requirement
+    (compliance-grade (string-ascii 2))
+    (minimum-stake uint)
+    (lock-period uint)
+    (reward-rate uint)
+    (slash-percentage uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= slash-percentage u100) err-invalid-threshold)
+    (map-set stake-requirements
+      { compliance-grade: compliance-grade }
+      {
+        minimum-stake: minimum-stake,
+        lock-period: lock-period,
+        reward-rate: reward-rate,
+        slash-percentage: slash-percentage
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-private (calculate-stake-rewards
+    (stake { staked-amount: uint, required-stake: uint, stake-locked-until: uint,
+            rewards-earned: uint, slashed-amount: uint, staker: principal,
+            staked-at: uint, last-reward-claim: uint })
+    (requirements { minimum-stake: uint, lock-period: uint, reward-rate: uint,
+                   slash-percentage: uint }))
+  (let (
+    (blocks-staked (- stacks-block-height (get last-reward-claim stake)))
+    (effective-stake (- (get staked-amount stake) (get slashed-amount stake)))
+    (reward-rate (get reward-rate requirements))
+  )
+    (/ (* (* effective-stake reward-rate) blocks-staked) u1000000)
+  )
+)
+
+(define-private (get-stake-requirement-for-grade (grade (string-ascii 2)))
+  (default-to
+    { minimum-stake: u1000000, lock-period: u1440, reward-rate: u100, slash-percentage: u50 }
+    (map-get? stake-requirements { compliance-grade: grade })
+  )
+)
+
 (define-read-only (get-license (license-id (string-ascii 50)))
   (map-get? licenses { license-id: license-id })
 )
@@ -924,6 +1148,82 @@
   )
 )
 
+(define-read-only (get-compliance-stake (project-id (string-ascii 100)))
+  (map-get? compliance-stakes { project-id: project-id })
+)
+
+(define-read-only (get-stake-requirement (compliance-grade (string-ascii 2)))
+  (map-get? stake-requirements { compliance-grade: compliance-grade })
+)
+
+(define-read-only (get-slashing-history (project-id (string-ascii 100)) (slash-id uint))
+  (map-get? stake-slashing-history { project-id: project-id, slash-id: slash-id })
+)
+
+(define-read-only (get-insurance-pool-info)
+  {
+    total-balance: (var-get insurance-pool-balance),
+    total-staked: (var-get total-staked-amount),
+    total-slashed: (var-get total-slashed-amount),
+    total-rewards: (var-get total-rewards-distributed)
+  }
+)
+
+(define-read-only (calculate-required-stake (project-id (string-ascii 100)))
+  (let (
+    (compliance-score (get-project-compliance-score project-id))
+    (grade (calculate-grade compliance-score))
+    (requirements (get-stake-requirement-for-grade grade))
+  )
+    (get minimum-stake requirements)
+  )
+)
+
+(define-read-only (get-stake-status (project-id (string-ascii 100)))
+  (match (map-get? compliance-stakes { project-id: project-id })
+    stake
+      {
+        is-staked: true,
+        staked-amount: (get staked-amount stake),
+        withdrawable-amount: (- (get staked-amount stake) (get slashed-amount stake)),
+        is-locked: (< stacks-block-height (get stake-locked-until stake)),
+        pending-rewards: (let (
+          (compliance-score (get-project-compliance-score project-id))
+          (grade (calculate-grade compliance-score))
+          (requirements (get-stake-requirement-for-grade grade))
+        )
+          (calculate-stake-rewards stake requirements)
+        )
+      }
+    {
+      is-staked: false,
+      staked-amount: u0,
+      withdrawable-amount: u0,
+      is-locked: false,
+      pending-rewards: u0
+    }
+  )
+)
+
+(define-read-only (get-project-financial-summary (project-id (string-ascii 100)))
+  (let (
+    (stake-info (get-stake-status project-id))
+    (compliance-score (get-project-compliance-score project-id))
+    (required-stake (calculate-required-stake project-id))
+  )
+    {
+      compliance-score: compliance-score,
+      required-stake: required-stake,
+      current-stake: (get staked-amount stake-info),
+      stake-coverage: (if (> required-stake u0)
+        (/ (* (get staked-amount stake-info) u100) required-stake)
+        u0),
+      pending-rewards: (get pending-rewards stake-info),
+      is-adequately-staked: (>= (get staked-amount stake-info) required-stake)
+    }
+  )
+)
+
 (define-read-only (get-contract-stats)
   {
     total-licenses: (var-get total-licenses),
@@ -932,6 +1232,10 @@
     total-violation-reports: (var-get total-violation-reports),
     total-resolved-disputes: (var-get total-resolved-disputes),
     total-certificates-issued: (var-get total-certificates-issued),
+    total-staked: (var-get total-staked-amount),
+    total-slashed: (var-get total-slashed-amount),
+    total-rewards: (var-get total-rewards-distributed),
+    insurance-pool: (var-get insurance-pool-balance),
     contract-owner: contract-owner
   }
 )
