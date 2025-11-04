@@ -1254,3 +1254,42 @@
     none
   )
 )
+
+(define-map project-release-anchors
+  { project-id: (string-ascii 100), release-id: (string-ascii 50) }
+  {
+    root-hash: (string-ascii 64),
+    uri: (string-ascii 500),
+    anchored-by: principal,
+    anchored-at: uint
+  }
+)
+
+(define-read-only (get-release-root (project-id (string-ascii 100)) (release-id (string-ascii 50)))
+  (map-get? project-release-anchors { project-id: project-id, release-id: release-id })
+)
+
+(define-public (anchor-release-root
+    (project-id (string-ascii 100))
+    (release-id (string-ascii 50))
+    (root-hash (string-ascii 64))
+    (uri (string-ascii 500)))
+  (begin
+    (asserts! (is-none (map-get? project-release-anchors { project-id: project-id, release-id: release-id })) err-already-exists)
+    (let (
+      (project-info (unwrap! (map-get? projects { project-id: project-id }) err-not-found))
+    )
+      (asserts! (is-eq tx-sender (get owner project-info)) err-unauthorized)
+      (map-set project-release-anchors
+        { project-id: project-id, release-id: release-id }
+        {
+          root-hash: root-hash,
+          uri: uri,
+          anchored-by: tx-sender,
+          anchored-at: stacks-block-height
+        }
+      )
+      (ok true)
+    )
+  )
+)
